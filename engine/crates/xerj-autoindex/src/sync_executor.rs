@@ -5055,7 +5055,14 @@ mod tests {
         })
         .unwrap();
         progress.tick();
-        assert_eq!(sizes, vec![EsSyncBackend::VERIFY_WINDOW, EsSyncBackend::VERIFY_WINDOW, 1]);
+        assert_eq!(
+            sizes,
+            vec![
+                EsSyncBackend::VERIFY_WINDOW,
+                EsSyncBackend::VERIFY_WINDOW,
+                1
+            ]
+        );
         let rendered = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
         let last = rendered
             .lines()
