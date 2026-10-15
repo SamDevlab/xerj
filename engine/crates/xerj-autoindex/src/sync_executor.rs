@@ -5066,6 +5066,41 @@ mod tests {
         assert!(last.contains("items=3/3"), "{last}");
     }
 
+    // A phase aggregates windows from different indices/fields. Empty input
+    // contributes no work, and an index with more than one window credits
+    // each of them before the next index begins.
+    #[test]
+    fn finalize_verify_progress_accumulates_across_indices() {
+        let (progress, buffer) = crate::progress::Progress::capture(
+            crate::progress::Surface::Plain,
+            std::time::Duration::from_secs(3600),
+        );
+        let values: Vec<String> = (0..(EsSyncBackend::VERIFY_WINDOW + 1))
+            .map(|i| format!("digest-{i}"))
+            .collect();
+        progress.phase("finalize-verify", 3, 0);
+        EsSyncBackend::for_each_verify_window(&progress, "records", &values, |_| Ok(())).unwrap();
+        EsSyncBackend::for_each_verify_window(&progress, "empty", &[], |_| {
+            panic!("empty input must not dispatch a query")
+        })
+        .unwrap();
+        EsSyncBackend::for_each_verify_window(
+            &progress,
+            crate::catalog::CATALOG_INDEX,
+            &["catalog-key".to_string()],
+            |_| Ok(()),
+        )
+        .unwrap();
+        progress.tick();
+        let rendered = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+        let last = rendered
+            .lines()
+            .rev()
+            .find(|line| line.starts_with("xerj-progress "))
+            .unwrap();
+        assert!(last.contains("items=3/3"), "{last}");
+    }
+
     // The guard counts attempted work even when a query fails, just as
     // Progress::file does elsewhere. Later windows must not be dispatched.
     #[test]
