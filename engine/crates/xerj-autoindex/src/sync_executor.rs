@@ -5037,6 +5037,94 @@ mod tests {
         assert!(journal.pending_sync.is_some());
     }
 
+    // Regression through the actual HTTP verification loop, not its window
+    // helper: before #1267 the three queries ran, but the progress surface
+    // stayed at 0/3 (or 1/3 with the caller's old index-scoped guard).
+    #[test]
+    fn finalize_verify_http_windows_advance_real_progress() {
+        use std::io::BufRead;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for expected_size in [
+                EsSyncBackend::VERIFY_WINDOW,
+                EsSyncBackend::VERIFY_WINDOW,
+                1,
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut first_line = String::new();
+                reader.read_line(&mut first_line).unwrap();
+                assert!(
+                    first_line.starts_with("POST /records/_search "),
+                    "unexpected search request: {first_line}"
+                );
+                let mut content_length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    if let Some(length) = line
+                        .to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .map(str::trim)
+                    {
+                        content_length = length.parse().unwrap();
+                    }
+                }
+                let mut body = vec![0; content_length];
+                reader.read_exact(&mut body).unwrap();
+                let request: Value = serde_json::from_slice(&body).unwrap();
+                let window = request
+                    .pointer("/query/bool/filter/0/terms/ax_file")
+                    .and_then(Value::as_array)
+                    .unwrap();
+                assert_eq!(window.len(), expected_size);
+                let reply = br#"{"aggregations":{"values":{"buckets":[]}}}"#;
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    reply.len()
+                )
+                .unwrap();
+                stream.write_all(reply).unwrap();
+            }
+        });
+
+        let es = crate::esclient::Es::new(&format!("http://{address}"), None).unwrap();
+        let state_dir = tempfile::tempdir().unwrap();
+        let (progress, output) = crate::progress::Progress::capture(
+            crate::progress::Surface::Plain,
+            std::time::Duration::from_secs(3600),
+        );
+        progress.phase("finalize-verify", 3, 0);
+        let backend = EsSyncBackend::new(&es, state_dir.path(), 64 * 1024, &progress);
+        let values: Vec<String> = (0..(2 * EsSyncBackend::VERIFY_WINDOW + 1))
+            .map(|i| format!("digest-{i}"))
+            .collect();
+        let counts = backend
+            .windowed_value_counts("records", "ax_file", &values, &[])
+            .unwrap();
+        assert_eq!(counts.len(), values.len());
+        assert!(counts.values().all(|count| *count == 0));
+        server.join().unwrap();
+        progress.tick();
+        let rendered = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        let last = rendered
+            .lines()
+            .rev()
+            .find(|line| line.starts_with("xerj-progress "))
+            .unwrap();
+        assert!(last.contains("items=3/3"), "{last}");
+    }
+
     // #1267: the progress counter follows window count, not index count.
     #[test]
     fn finalize_verify_progress_counts_windows_not_indices() {
