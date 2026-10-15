@@ -742,6 +742,22 @@ impl<'a> EsSyncBackend<'a> {
     /// `windowed_value_counts` always requests.
     const VERIFY_WINDOW: usize = 1024;
 
+    /// Track processed query windows, matching the finalize-verify denominator.
+    /// An index may span multiple windows (#1267); an index-scoped file guard
+    /// credits only one unit and leaves the phase below 100%.
+    fn for_each_verify_window(
+        pr: &crate::progress::Progress,
+        index: &str,
+        values: &[String],
+        mut process: impl FnMut(&[String]) -> Result<()>,
+    ) -> Result<()> {
+        for window in values.chunks(Self::VERIFY_WINDOW) {
+            let _reading = pr.file(index, 0);
+            process(window)?;
+        }
+        Ok(())
+    }
+
     /// Exact live-row count per value of a keyword content-digest field
     /// (`ax_file` on data indices, `file_key` on the catalog), read windowed:
     /// one `terms` filter + one `terms` aggregation per [`Self::VERIFY_WINDOW`]
@@ -768,7 +784,7 @@ impl<'a> EsSyncBackend<'a> {
     ) -> Result<HashMap<String, u64>> {
         let mut counts: HashMap<String, u64> =
             values.iter().map(|value| (value.clone(), 0u64)).collect();
-        for window in values.chunks(Self::VERIFY_WINDOW) {
+        Self::for_each_verify_window(self.pr, index, values, |window| {
             let mut filter = Vec::with_capacity(1 + extra_filters.len());
             filter.push(serde_json::json!({"terms": {field: window}}));
             filter.extend(extra_filters.iter().cloned());
@@ -797,7 +813,8 @@ impl<'a> EsSyncBackend<'a> {
                     .context("batched validation bucket has no doc_count")?;
                 counts.insert(key.to_owned(), doc_count);
             }
-        }
+            Ok(())
+        })?;
         Ok(counts)
     }
 
@@ -826,7 +843,7 @@ impl<'a> EsSyncBackend<'a> {
         const MAX_PAGES: usize = 64;
         let mut counts: HashMap<String, u64> =
             values.iter().map(|value| (value.clone(), 0u64)).collect();
-        for window in values.chunks(Self::VERIFY_WINDOW) {
+        Self::for_each_verify_window(self.pr, crate::catalog::CATALOG_INDEX, values, |window| {
             let mut from = 0usize;
             let mut window_total: Option<u64> = None;
             let mut pages = 0usize;
@@ -885,7 +902,8 @@ impl<'a> EsSyncBackend<'a> {
                 "catalog read-back counted {counted} of {} matched documents in a window",
                 window_total.unwrap_or(0)
             );
-        }
+            Ok(())
+        })?;
         Ok(counts)
     }
 
@@ -1556,13 +1574,11 @@ impl SyncOperationBackend for EsSyncBackend<'_> {
 
         let mut record_counts: HashMap<String, HashMap<String, u64>> = HashMap::new();
         for (index, values) in &record_wanted {
-            let _reading = self.pr.file(index, 0);
             let counts = self.windowed_value_counts(index, "ax_file", values, &[])?;
             record_counts.insert(index.clone(), counts);
         }
         let mut semantic_counts: HashMap<(String, String), HashMap<String, u64>> = HashMap::new();
         for ((index, field), values) in &semantic_wanted {
-            let _reading = self.pr.file(index, 0);
             let exists = serde_json::json!({"exists": {"field": field}});
             let counts = self.windowed_value_counts(index, "ax_file", values, &[exists])?;
             semantic_counts.insert((index.clone(), field.clone()), counts);
@@ -1584,7 +1600,6 @@ impl SyncOperationBackend for EsSyncBackend<'_> {
         let catalog_counts = if catalog_wanted.is_empty() {
             HashMap::new()
         } else {
-            let _reading = self.pr.file(crate::catalog::CATALOG_INDEX, 0);
             self.windowed_catalog_counts(&catalog_wanted, &snapshot.tx_id)?
         };
 
@@ -5020,6 +5035,198 @@ mod tests {
         assert_eq!(backend.validations, 0);
         assert_eq!(journal.committed_manifest.as_ref().unwrap().generation, 0);
         assert!(journal.pending_sync.is_some());
+    }
+
+    // Regression through the actual HTTP verification loop, not its window
+    // helper: before #1267 the three queries ran, but the progress surface
+    // stayed at 0/3 (or 1/3 with the caller's old index-scoped guard).
+    #[test]
+    fn finalize_verify_http_windows_advance_real_progress() {
+        use std::io::BufRead;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for expected_size in [
+                EsSyncBackend::VERIFY_WINDOW,
+                EsSyncBackend::VERIFY_WINDOW,
+                1,
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut first_line = String::new();
+                reader.read_line(&mut first_line).unwrap();
+                assert!(
+                    first_line.starts_with("POST /records/_search "),
+                    "unexpected search request: {first_line}"
+                );
+                let mut content_length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    if let Some(length) = line
+                        .to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .map(str::trim)
+                    {
+                        content_length = length.parse().unwrap();
+                    }
+                }
+                let mut body = vec![0; content_length];
+                reader.read_exact(&mut body).unwrap();
+                let request: Value = serde_json::from_slice(&body).unwrap();
+                let window = request
+                    .pointer("/query/bool/filter/0/terms/ax_file")
+                    .and_then(Value::as_array)
+                    .unwrap();
+                assert_eq!(window.len(), expected_size);
+                let reply = br#"{"aggregations":{"values":{"buckets":[]}}}"#;
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    reply.len()
+                )
+                .unwrap();
+                stream.write_all(reply).unwrap();
+            }
+        });
+
+        let es = crate::esclient::Es::new(&format!("http://{address}"), None).unwrap();
+        let state_dir = tempfile::tempdir().unwrap();
+        let (progress, output) = crate::progress::Progress::capture(
+            crate::progress::Surface::Plain,
+            std::time::Duration::from_secs(3600),
+        );
+        progress.phase("finalize-verify", 3, 0);
+        let backend = EsSyncBackend::new(&es, state_dir.path(), 64 * 1024, &progress);
+        let values: Vec<String> = (0..(2 * EsSyncBackend::VERIFY_WINDOW + 1))
+            .map(|i| format!("digest-{i}"))
+            .collect();
+        let counts = backend
+            .windowed_value_counts("records", "ax_file", &values, &[])
+            .unwrap();
+        assert_eq!(counts.len(), values.len());
+        assert!(counts.values().all(|count| *count == 0));
+        server.join().unwrap();
+        progress.tick();
+        let rendered = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        let last = rendered
+            .lines()
+            .rev()
+            .find(|line| line.starts_with("xerj-progress "))
+            .unwrap();
+        assert!(last.contains("items=3/3"), "{last}");
+    }
+
+    // #1267: the progress counter follows window count, not index count.
+    #[test]
+    fn finalize_verify_progress_counts_windows_not_indices() {
+        let (progress, buffer) = crate::progress::Progress::capture(
+            crate::progress::Surface::Plain,
+            std::time::Duration::from_secs(3600),
+        );
+        let values: Vec<String> = (0..(2 * EsSyncBackend::VERIFY_WINDOW + 1))
+            .map(|i| format!("digest-{i}"))
+            .collect();
+        progress.phase("finalize-verify", 3, 0);
+        let mut sizes = Vec::new();
+        EsSyncBackend::for_each_verify_window(&progress, "records", &values, |window| {
+            sizes.push(window.len());
+            Ok(())
+        })
+        .unwrap();
+        progress.tick();
+        assert_eq!(
+            sizes,
+            vec![
+                EsSyncBackend::VERIFY_WINDOW,
+                EsSyncBackend::VERIFY_WINDOW,
+                1
+            ]
+        );
+        let rendered = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+        let last = rendered
+            .lines()
+            .rev()
+            .find(|line| line.starts_with("xerj-progress "))
+            .unwrap();
+        assert!(last.contains("phase=finalize-verify"), "{last}");
+        assert!(last.contains("items=3/3"), "{last}");
+    }
+
+    // A phase aggregates windows from different indices/fields. Empty input
+    // contributes no work, and an index with more than one window credits
+    // each of them before the next index begins.
+    #[test]
+    fn finalize_verify_progress_accumulates_across_indices() {
+        let (progress, buffer) = crate::progress::Progress::capture(
+            crate::progress::Surface::Plain,
+            std::time::Duration::from_secs(3600),
+        );
+        let values: Vec<String> = (0..(EsSyncBackend::VERIFY_WINDOW + 1))
+            .map(|i| format!("digest-{i}"))
+            .collect();
+        progress.phase("finalize-verify", 3, 0);
+        EsSyncBackend::for_each_verify_window(&progress, "records", &values, |_| Ok(())).unwrap();
+        EsSyncBackend::for_each_verify_window(&progress, "empty", &[], |_| {
+            panic!("empty input must not dispatch a query")
+        })
+        .unwrap();
+        EsSyncBackend::for_each_verify_window(
+            &progress,
+            crate::catalog::CATALOG_INDEX,
+            &["catalog-key".to_string()],
+            |_| Ok(()),
+        )
+        .unwrap();
+        progress.tick();
+        let rendered = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+        let last = rendered
+            .lines()
+            .rev()
+            .find(|line| line.starts_with("xerj-progress "))
+            .unwrap();
+        assert!(last.contains("items=3/3"), "{last}");
+    }
+
+    // The guard counts attempted work even when a query fails, just as
+    // Progress::file does elsewhere. Later windows must not be dispatched.
+    #[test]
+    fn finalize_verify_progress_does_not_run_windows_after_error() {
+        let (progress, buffer) = crate::progress::Progress::capture(
+            crate::progress::Surface::Plain,
+            std::time::Duration::from_secs(3600),
+        );
+        let values: Vec<String> = (0..(2 * EsSyncBackend::VERIFY_WINDOW + 1))
+            .map(|i| format!("digest-{i}"))
+            .collect();
+        progress.phase("finalize-verify", 3, 0);
+        let mut attempted = 0;
+        let error = EsSyncBackend::for_each_verify_window(&progress, "records", &values, |_| {
+            attempted += 1;
+            if attempted == 2 {
+                anyhow::bail!("injected query failure");
+            }
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("injected query failure"));
+        assert_eq!(attempted, 2, "the third window must not be dispatched");
+        progress.tick();
+        let rendered = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+        let last = rendered
+            .lines()
+            .rev()
+            .find(|line| line.starts_with("xerj-progress "))
+            .unwrap();
+        assert!(last.contains("items=2/3"), "{last}");
     }
 
     // ── #1212 shape 2: the read-back barrier re-walks an unflagged short page ──
