@@ -742,7 +742,7 @@ impl<'a> EsSyncBackend<'a> {
     /// `windowed_value_counts` always requests.
     const VERIFY_WINDOW: usize = 1024;
 
-    /// Track completed query windows, matching the finalize-verify denominator.
+    /// Track processed query windows, matching the finalize-verify denominator.
     /// An index may span multiple windows (#1267); an index-scoped file guard
     /// credits only one unit and leaves the phase below 100%.
     fn for_each_verify_window(
@@ -843,67 +843,72 @@ impl<'a> EsSyncBackend<'a> {
         const MAX_PAGES: usize = 64;
         let mut counts: HashMap<String, u64> =
             values.iter().map(|value| (value.clone(), 0u64)).collect();
-        Self::for_each_verify_window(self.pr, crate::catalog::CATALOG_INDEX, values, |window| {
-            let mut from = 0usize;
-            let mut window_total: Option<u64> = None;
-            let mut pages = 0usize;
-            loop {
-                anyhow::ensure!(
-                    pages < MAX_PAGES,
-                    "catalog read-back window needed more than {MAX_PAGES} pages"
-                );
-                pages += 1;
-                let response = self.es.search(
-                    crate::catalog::CATALOG_INDEX,
-                    &serde_json::json!({
-                        "size": PAGE,
-                        "from": from,
-                        "track_total_hits": true,
-                        "_source": ["file_key"],
-                        "query": {"bool": {"filter": [
-                            {"terms": {"file_key": window}},
-                            {"term": {"run_id": run_id}}
-                        ]}}
-                    }),
-                )?;
-                let page_total = response
-                    .pointer("/hits/total/value")
-                    .and_then(Value::as_u64)
-                    .context("catalog read-back response has no total hit count")?;
-                if let Some(seen) = window_total {
+        Self::for_each_verify_window(
+            self.pr,
+            crate::catalog::CATALOG_INDEX,
+            values,
+            |window| {
+                let mut from = 0usize;
+                let mut window_total: Option<u64> = None;
+                let mut pages = 0usize;
+                loop {
                     anyhow::ensure!(
-                        seen == page_total,
-                        "catalog read-back total moved from {seen} to {page_total} mid-window"
+                        pages < MAX_PAGES,
+                        "catalog read-back window needed more than {MAX_PAGES} pages"
                     );
-                }
-                window_total = Some(page_total);
-                let hits = response
-                    .pointer("/hits/hits")
-                    .and_then(Value::as_array)
-                    .context("catalog read-back response has no hits array")?;
-                if hits.is_empty() {
-                    break;
-                }
-                for hit in hits {
-                    if let Some(key) = hit.pointer("/_source/file_key").and_then(Value::as_str) {
-                        if let Some(count) = counts.get_mut(key) {
-                            *count += 1;
+                    pages += 1;
+                    let response = self.es.search(
+                        crate::catalog::CATALOG_INDEX,
+                        &serde_json::json!({
+                            "size": PAGE,
+                            "from": from,
+                            "track_total_hits": true,
+                            "_source": ["file_key"],
+                            "query": {"bool": {"filter": [
+                                {"terms": {"file_key": window}},
+                                {"term": {"run_id": run_id}}
+                            ]}}
+                        }),
+                    )?;
+                    let page_total = response
+                        .pointer("/hits/total/value")
+                        .and_then(Value::as_u64)
+                        .context("catalog read-back response has no total hit count")?;
+                    if let Some(seen) = window_total {
+                        anyhow::ensure!(
+                            seen == page_total,
+                            "catalog read-back total moved from {seen} to {page_total} mid-window"
+                        );
+                    }
+                    window_total = Some(page_total);
+                    let hits = response
+                        .pointer("/hits/hits")
+                        .and_then(Value::as_array)
+                        .context("catalog read-back response has no hits array")?;
+                    if hits.is_empty() {
+                        break;
+                    }
+                    for hit in hits {
+                        if let Some(key) = hit.pointer("/_source/file_key").and_then(Value::as_str) {
+                            if let Some(count) = counts.get_mut(key) {
+                                *count += 1;
+                            }
                         }
                     }
+                    from += hits.len();
+                    if from as u64 >= page_total {
+                        break;
+                    }
                 }
-                from += hits.len();
-                if from as u64 >= page_total {
-                    break;
-                }
-            }
-            let counted: u64 = window.iter().filter_map(|value| counts.get(value)).sum();
-            anyhow::ensure!(
-                counted == window_total.unwrap_or(0),
-                "catalog read-back counted {counted} of {} matched documents in a window",
-                window_total.unwrap_or(0)
-            );
-            Ok(())
-        })?;
+                let counted: u64 = window.iter().filter_map(|value| counts.get(value)).sum();
+                anyhow::ensure!(
+                    counted == window_total.unwrap_or(0),
+                    "catalog read-back counted {counted} of {} matched documents in a window",
+                    window_total.unwrap_or(0)
+                );
+                Ok(())
+            },
+        )?;
         Ok(counts)
     }
 
@@ -5055,7 +5060,10 @@ mod tests {
         })
         .unwrap();
         progress.tick();
-        assert_eq!(sizes, vec![1024, 1024, 1]);
+        assert_eq!(
+            sizes,
+            vec![EsSyncBackend::VERIFY_WINDOW, EsSyncBackend::VERIFY_WINDOW, 1]
+        );
         let rendered = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
         let last = rendered
             .lines()
@@ -5064,6 +5072,44 @@ mod tests {
             .unwrap();
         assert!(last.contains("phase=finalize-verify"), "{last}");
         assert!(last.contains("items=3/3"), "{last}");
+    }
+
+    // The guard counts attempted work even when a query fails, just as
+    // Progress::file does elsewhere. Later windows must not be dispatched.
+    #[test]
+    fn finalize_verify_progress_does_not_run_windows_after_error() {
+        let (progress, buffer) = crate::progress::Progress::capture(
+            crate::progress::Surface::Plain,
+            std::time::Duration::from_secs(3600),
+        );
+        let values: Vec<String> = (0..(2 * EsSyncBackend::VERIFY_WINDOW + 1))
+            .map(|i| format!("digest-{i}"))
+            .collect();
+        progress.phase("finalize-verify", 3, 0);
+        let mut attempted = 0;
+        let error = EsSyncBackend::for_each_verify_window(
+            &progress,
+            "records",
+            &values,
+            |_| {
+                attempted += 1;
+                if attempted == 2 {
+                    anyhow::bail!("injected query failure");
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("injected query failure"));
+        assert_eq!(attempted, 2, "the third window must not be dispatched");
+        progress.tick();
+        let rendered = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+        let last = rendered
+            .lines()
+            .rev()
+            .find(|line| line.starts_with("xerj-progress "))
+            .unwrap();
+        assert!(last.contains("items=2/3"), "{last}");
     }
 
     // ── #1212 shape 2: the read-back barrier re-walks an unflagged short page ──
